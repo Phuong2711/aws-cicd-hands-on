@@ -1,0 +1,207 @@
+# =====================================================================
+# CI/CD: Test -> Build & Publish Layer -> Deploy code -> Smoke test
+#
+# Cấu hình cần có trên GitHub repo (Settings > Secrets and variables > Actions):
+#   Secret   AWS_ROLE_ARN          = output github_deploy_role_arn của Terraform
+#   Variable AWS_REGION            = us-east-1
+#   Variable LAMBDA_FUNCTION_NAME  = aws-cicd-hands-on-fn
+#   Variable LAMBDA_LAYER_NAME     = aws-cicd-hands-on-deps
+# =====================================================================
+name: Deploy Lambda
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: # cho phép bấm "Run workflow" bằng tay trên UI
+
+# Không cho 2 lần deploy chạy song song lên cùng 1 function
+concurrency:
+  group: deploy-lambda-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12" # phải khớp var.lambda_runtime trong Terraform
+
+permissions:
+  id-token: write # bắt buộc để lấy OIDC token -> assume role AWS
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------
+  # JOB 1: CI - chạy unit test. Fail ở đây thì không deploy gì cả.
+  # ------------------------------------------------------------------
+  test:
+    name: Unit test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        run: pytest -v
+
+  # ------------------------------------------------------------------
+  # JOB 2: Build layer từ requirements.txt và publish lên AWS.
+  # Tối ưu: nếu requirements.txt không đổi (hash trùng với 1 layer version
+  # đã có) thì tái sử dụng ARN cũ, không publish version mới.
+  # ------------------------------------------------------------------
+  layer:
+    name: Build & publish layer
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      layer_arn: ${{ steps.resolve.outputs.layer_arn }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-layer-${{ github.run_id }}
+
+      - name: Compute requirements hash
+        id: hash
+        run: |
+          HASH=$(sha256sum src/requirements.txt | cut -c1-16)
+          echo "value=$HASH" >> "$GITHUB_OUTPUT"
+          echo "requirements hash = $HASH"
+
+      - name: Check if layer with same hash already exists
+        id: existing
+        run: |
+          ARN=$(aws lambda list-layer-versions \
+            --layer-name "${{ vars.LAMBDA_LAYER_NAME }}" \
+            --query "LayerVersions[?Description=='${{ steps.hash.outputs.value }}'].LayerVersionArn | [0]" \
+            --output text 2>/dev/null || echo "None")
+          if [ "$ARN" = "None" ] || [ -z "$ARN" ]; then
+            echo "Không có layer nào khớp hash -> sẽ build mới"
+            echo "arn=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tìm thấy layer khớp hash: $ARN -> tái sử dụng"
+            echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build layer zip
+        if: steps.existing.outputs.arn == ''
+        run: ./scripts/build_layer.sh
+
+      - name: Upload layer artifact (để debug / tải về xem)
+        if: steps.existing.outputs.arn == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: layer-${{ steps.hash.outputs.value }}
+          path: build/layer.zip
+          retention-days: 7
+
+      - name: Publish new layer version
+        id: publish
+        if: steps.existing.outputs.arn == ''
+        run: |
+          ARN=$(aws lambda publish-layer-version \
+            --layer-name "${{ vars.LAMBDA_LAYER_NAME }}" \
+            --description "${{ steps.hash.outputs.value }}" \
+            --zip-file fileb://build/layer.zip \
+            --compatible-runtimes "python${{ env.PYTHON_VERSION }}" \
+            --compatible-architectures x86_64 \
+            --query LayerVersionArn --output text)
+          echo "Published: $ARN"
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve final layer ARN
+        id: resolve
+        run: |
+          ARN="${{ steps.existing.outputs.arn }}"
+          if [ -z "$ARN" ]; then ARN="${{ steps.publish.outputs.arn }}"; fi
+          echo "layer_arn=$ARN" >> "$GITHUB_OUTPUT"
+          echo "### Layer" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ARN: \`$ARN\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Reused: ${{ steps.existing.outputs.arn != '' }}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------
+  # JOB 3: Zip code, update function code, gắn layer, smoke test.
+  # ------------------------------------------------------------------
+  deploy:
+    name: Deploy function
+    runs-on: ubuntu-latest
+    needs: layer
+    environment: production # hiện trên tab Environments; có thể bật "required reviewers"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Build function zip
+        run: ./scripts/build_function.sh
+
+      - name: Update function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+            --zip-file fileb://build/function.zip \
+            --no-cli-pager
+          # Lambda cập nhật bất đồng bộ; phải chờ xong mới được gọi update tiếp
+          aws lambda wait function-updated \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}"
+
+      - name: Attach layer & update description
+        run: |
+          aws lambda update-function-configuration \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+            --layers "${{ needs.layer.outputs.layer_arn }}" \
+            --description "Deployed by GitHub Actions run ${{ github.run_number }} (${{ github.sha }})" \
+            --no-cli-pager
+          aws lambda wait function-updated \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}"
+
+      - name: Smoke test (invoke Lambda)
+        run: |
+          aws lambda invoke \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+            --payload '{"name": "GitHub Actions"}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json
+          echo "Response:"; cat response.json; echo
+          # Nếu handler lỗi (vd thiếu layer), response sẽ có FunctionError
+          if grep -q '"errorMessage"' response.json; then
+            echo "::error::Lambda trả về lỗi"; exit 1
+          fi
+          grep -q '"statusCode": 200' response.json
+
+      - name: Write summary
+        run: |
+          {
+            echo "### Deploy"
+            echo "- Function: \`${{ vars.LAMBDA_FUNCTION_NAME }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Layer: \`${{ needs.layer.outputs.layer_arn }}\`"
+            echo '```json'; cat response.json; echo; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

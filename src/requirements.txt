@@ -1,0 +1,2 @@
+# Dependencies của Lambda -> được đóng gói thành Lambda Layer (không nằm trong zip code)
+requests==2.32.3
