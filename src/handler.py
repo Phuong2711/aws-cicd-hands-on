@@ -9,7 +9,7 @@ Lambda handler đơn giản để demo CI/CD.
 import json
 import os
 
-import requests  # được cung cấp bởi Lambda Layer
+import requests
 
 
 APP_VERSION = "1.0.0"
